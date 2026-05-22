@@ -1,5 +1,4 @@
 name: Weekly link check (lychee)
-
 on:
   schedule:
     # 每週一 00:00 UTC = 台北 08:00
@@ -32,159 +31,145 @@ jobs:
       - name: Expand sitemap URLs
         run: |
           set -euo pipefail
-
           python - <<'PY'
           import urllib.parse
-          import urllib.request
           import xml.etree.ElementTree as ET
+          from dataclasses import dataclass
+          from pathlib import Path
+          import urllib.request
 
-          USER_AGENT = "PaperShoot-LinkCheck/1.0"
+          @dataclass
+          class Site:
+            url: str
+            base_url: str
 
-          def read_list(path):
-            items = []
-            try:
-              with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                  line = line.strip()
-                  if not line or line.startswith("#"):
-                    continue
-                  items.append(line)
-            except FileNotFoundError:
-              pass
-            return items
+          def read_lines(path: Path):
+            for line in path.read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if not line or line.startswith('#'):
+                continue
+              yield line
 
-          def fetch(url):
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=30) as resp:
-              return resp.read()
+          def fetch(url: str, timeout: float = 20.0) -> str:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+              return resp.read().decode('utf-8', errors='replace')
 
-          NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+          def parse_sitemap(root: ET.Element, base_url: str, out: list[str]):
+            ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
+            if root.tag.endswith('sitemapindex'):
+              for loc in root.findall('.//sm:loc', ns):
+                url = loc.text.strip()
+                if url:
+                  out.append(url)
+            else:
+              # urlset
+              for loc in root.findall('.//sm:loc', ns):
+                url = loc.text.strip()
+                if url:
+                  out.append(url)
 
-          def parse_sitemap(xml_bytes):
-            root = ET.fromstring(xml_bytes)
-            if root.tag.endswith("sitemapindex"):
-              locs = []
-              for sm in root.findall(NS + "sitemap"):
-                loc = sm.findtext(NS + "loc")
-                if loc:
-                  locs.append(loc.strip())
-              return ("index", locs)
-            if root.tag.endswith("urlset"):
-              locs = []
-              for u in root.findall(NS + "url"):
-                loc = u.findtext(NS + "loc")
-                if loc:
-                  locs.append(loc.strip())
-              return ("urlset", locs)
-            raise ValueError(f"Unknown sitemap root: {root.tag}")
-
-          def process_sitemap(url, seen, urls):
-            url = url.strip()
-            if not url:
-              return
+          def expand_sitemap(url: str, seen: set[str], out: list[str], base_url: str):
             if url in seen:
               return
             seen.add(url)
-
-            # Ignore on-site relative references; treat them as URLs.
-            if not urllib.parse.urlsplit(url).scheme:
-              url = urllib.parse.urljoin("https://www.papershoot.com", url)
-
             try:
-              xml_bytes = fetch(url)
-            except Exception as e:
-              print(f"Skipped sitemap fetch ({url}): {e}")
+              text = fetch(url)
+            except Exception:
+              return
+            try:
+              root = ET.fromstring(text)
+            except ET.ParseError:
               return
 
-            try:
-              root_type, locs = parse_sitemap(xml_bytes)
-            except Exception as e:
-              print(f"Skipped sitemap parse ({url}): {e}")
-              return
-
-            if root_type == "index":
-              for loc in locs:
-                process_sitemap(loc, seen, urls)
+            if root.tag.endswith('sitemapindex'):
+              items: list[str] = []
+              parse_sitemap(root, base_url, items)
+              for child in items:
+                expand_sitemap(child, seen, out, base_url)
             else:
-              urls.extend(locs)
+              parse_sitemap(root, base_url, out)
 
-          base_urls = []
-          base_urls.extend(read_list("urls.txt"))
-          base_urls.extend(read_list("extra_urls.txt"))
+          base = 'https://www.papershoot.com'
+          expanded: list[str] = []
 
-          base_sitemaps = []
-          base_sitemaps.extend(read_list("extra_sitemaps.txt"))
-          base_sitemaps.extend([
-            "https://www.papershoot.com/sitemap.xml",
-            "https://www.papershoot.com/sitemap_index.xml",
-            "https://www.papershoot.com/sitemap-index.xml",
-            "https://www.papershoot.com/sitemapindex.xml",
-          ])
+          urls_txt = Path('urls.txt')
+          if urls_txt.exists():
+            expanded.extend(read_lines(urls_txt))
 
-          # Remove bad encoding artifacts and whitespace
-          expanded = [url.strip() for url in base_urls if url.strip()]
+          extra_urls = Path('extra_urls.txt')
+          if extra_urls.exists():
+            expanded.extend(read_lines(extra_urls))
 
-          seen = set()
-          for sm in base_sitemaps:
-            process_sitemap(sm, seen, expanded)
+          extra_sitemaps = Path('extra_sitemaps.txt')
+          if extra_sitemaps.exists():
+            expanded.extend(read_lines(extra_sitemaps))
 
-          # Deduplicate
-          expanded = list(dict.fromkeys(expanded))
+          # Try common sitemap endpoints.
+          sitemap_candidates = [
+            f"{base}/sitemap.xml",
+            f"{base}/sitemap_index.xml",
+            f"{base}/sitemap-index.xml",
+            f"{base}/sitemapindex.xml",
+          ]
 
-          with open("expanded_urls.txt", "w", encoding="utf-8") as f:
-            for url in expanded:
-              f.write(url + "\n")
+          seen: set[str] = set()
+          sitemap_urls: list[str] = []
+          for sm in sitemap_candidates:
+            expand_sitemap(sm, seen, sitemap_urls, base)
 
-          print(f"Expanded URLs written: {len(expanded)}")
+          expanded.extend(sitemap_urls)
+
+          # Add key landing page (marketing)
+          expanded.append('https://www.papershoot.com/products/paper-shoot-camera')
+
+          # Deduplicate while preserving order
+          deduped: list[str] = []
+          seen_target: set[str] = set()
+          for u in expanded:
+            if u not in seen_target:
+              deduped.append(u)
+              seen_target.add(u)
+
+          Path('expanded_urls.txt').write_text('\n'.join(deduped), encoding='utf-8')
           PY
 
       - name: Run lychee
         id: lychee
         uses: lycheeverse/lychee-action@v2
-        with:
-          args: >
-            --config lychee.toml
-            --cache
-            --max-cache-age 7d
-            --format json
-            --output report.json
-            @expanded_urls.txt
         continue-on-error: true
+        with:
+          args: --config lychee.toml --cache --format json --output report.json --files-from expanded_urls.txt
 
       - name: Build report.md
-        if: always()
         run: |
           python - <<'PY'
           import json
-          from pathlib import Path
+          import pathlib
 
-          report_md = Path("report.md")
-
-          if not Path("report.json").exists():
-            report_md.write_text("report.json missing.\n", encoding="utf-8")
+          path = pathlib.Path('report.json')
+          md = ['Link check report\n']
+          if not path.exists():
+            md.append('report.json was not generated.\n')
           else:
-            raw = Path("report.json").read_text(encoding="utf-8", errors="replace")
+            raw = path.read_text(encoding='utf-8')
             try:
               data = json.loads(raw)
-              report_md.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-            except Exception as e:
-              report_md.write_text(
-                f"Lychee report could not be parsed as JSON: {e}\n\nRaw content:\n\n```
-{raw}
-```\n",
-                encoding="utf-8",
-              )
+              failures = data.get('failures', [])
+              if not failures:
+                md.append('No broken links detected.\n')
+              else:
+                md.append(f"Broken links detected: {len(failures)}\n\n")
+                for i, fail in enumerate(failures, 1):
+                  target = fail.get('target', '')
+                  status = fail.get('status', '')
+                  md.append(f"{i}. {target} (status: {status})\n")
+            except Exception:
+              md.append('report.json is not valid JSON; raw content follows:\n\n')
+              md.append(raw)
+          pathlib.Path('report.md').write_text(''.join(md), encoding='utf-8')
           PY
 
-      - name: Save lychee cache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: .lycheecache
-          key: cache-lychee-${{ github.run_id }}
-
       - name: Upload reports (artifact)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: link-check-reports
@@ -200,29 +185,19 @@ jobs:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "SLACK_WEBHOOK_URL not set; skipping Slack notification."
             exit 0
           fi
 
-          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-
-          payload=$(cat <<'JSON'
-          {
-            "text": ":rotating_light: Lychee link check failed.\nRun: RUN_URL"
-          }
-          JSON
-          )
-          payload=${payload//RUN_URL/$RUN_URL}
-          curl -X POST -H 'Content-type: application/json' --data "${payload}" "$SLACK_WEBHOOK_URL"
-
-      - name: Fail if lychee found issues
-        if: steps.lychee.outcome == 'failure'
-        run: |
-          echo "Broken links detected; failing job."
-          exit 1
+          STATUS="✅ No broken links"
+          STATUS="❌ Broken links detected"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat <<EOF >/tmp/slack.json
+          {"text":"Link check status: $STATUS\nRun URL: $RUN_URL"}
+          EOF
+          curl -X POST -H 'Content-type: application/json' --data @/tmp/slack.json "$SLACK_WEBHOOK_URL"
 
       - name: Create issue if failed
-        if: failure()
+        if: steps.lychee.outcome == 'failure'
         uses: peter-evans/create-issue-from-file@v5
         with:
           title: "Broken links detected (lychee)"
@@ -232,3 +207,7 @@ jobs:
             priority:medium
           assignees: |
             Georgelin0525
+
+      - name: Fail job if lychee found issues
+        if: steps.lychee.outcome == 'failure'
+        run: exit 1
