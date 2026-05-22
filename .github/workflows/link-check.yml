@@ -31,106 +31,109 @@ jobs:
       - name: Expand sitemap URLs
         run: |
           set -euo pipefail
+
           python - <<'PY'
-          import urllib.parse
-          import xml.etree.ElementTree as ET
-          from dataclasses import dataclass
-          from pathlib import Path
+          import os
+          from urllib.parse import urljoin
           import urllib.request
+          import urllib.error
+          import xml.etree.ElementTree as ET
 
-          @dataclass
-          class Site:
-            url: str
-            base_url: str
-
-          def read_lines(path: Path):
-            for line in path.read_text(encoding="utf-8").splitlines():
-              line = line.strip()
-              if not line or line.startswith('#'):
-                continue
-              yield line
-
-          def fetch(url: str, timeout: float = 20.0) -> str:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:
-              return resp.read().decode('utf-8', errors='replace')
-
-          def parse_sitemap(root: ET.Element, base_url: str, out: list[str]):
-            ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-            if root.tag.endswith('sitemapindex'):
-              for loc in root.findall('.//sm:loc', ns):
-                url = loc.text.strip()
-                if url:
-                  out.append(url)
-            else:
-              # urlset
-              for loc in root.findall('.//sm:loc', ns):
-                url = loc.text.strip()
-                if url:
-                  out.append(url)
-
-          def expand_sitemap(url: str, seen: set[str], out: list[str], base_url: str):
-            if url in seen:
-              return
-            seen.add(url)
+          def read_lines(path):
+            urls = []
             try:
-              text = fetch(url)
-            except Exception:
-              return
+              with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                    continue
+                  urls.append(line)
+            except FileNotFoundError:
+              pass
+            return urls
+
+          def fetch(url):
             try:
-              root = ET.fromstring(text)
-            except ET.ParseError:
+              with urllib.request.urlopen(url) as resp:
+                return resp.read()
+            except Exception as e:
+              print(f"[WARN] fetch failed: {url} ({e})")
+              return None
+
+          def parse_sitemap(content, base_url, out_urls, max_depth):
+            """Populate out_urls with <loc> URLs.
+            Handles urlset and sitemapindex recursively up to max_depth.
+            """
+            try:
+              root = ET.fromstring(content)
+            except ET.ParseError as e:
+              print(f"[WARN] parse error {base_url}: {e}")
               return
 
-            if root.tag.endswith('sitemapindex'):
-              items: list[str] = []
-              parse_sitemap(root, base_url, items)
-              for child in items:
-                expand_sitemap(child, seen, out, base_url)
-            else:
-              parse_sitemap(root, base_url, out)
+            ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 
-          base = 'https://www.papershoot.com'
-          expanded: list[str] = []
+            if root.tag == ns + "urlset":
+              for url_el in root.findall(ns + "url"):
+                loc_el = url_el.find(ns + "loc")
+                if loc_el is None or not loc_el.text:
+                  continue
+                out_urls.add(loc_el.text.strip())
 
-          urls_txt = Path('urls.txt')
-          if urls_txt.exists():
-            expanded.extend(read_lines(urls_txt))
+            elif root.tag == ns + "sitemapindex":
+              if max_depth <= 0:
+                return
+              for sm_el in root.findall(ns + "sitemap"):
+                loc_el = sm_el.find(ns + "loc")
+                if loc_el is None or not loc_el.text:
+                  continue
+                sm_url = loc_el.text.strip()
+                content2 = fetch(sm_url)
+                if content2 is None:
+                  continue
+                parse_sitemap(content2, sm_url, out_urls, max_depth - 1)
 
-          extra_urls = Path('extra_urls.txt')
-          if extra_urls.exists():
-            expanded.extend(read_lines(extra_urls))
+          targets = set()
+          targets.update(read_lines("urls.txt"))
+          targets.update(read_lines("extra_urls.txt"))
 
-          extra_sitemaps = Path('extra_sitemaps.txt')
-          if extra_sitemaps.exists():
-            expanded.extend(read_lines(extra_sitemaps))
+          sitemaps = []
+          sitemaps.extend(read_lines("extra_sitemaps.txt"))
 
-          # Try common sitemap endpoints.
-          sitemap_candidates = [
-            f"{base}/sitemap.xml",
-            f"{base}/sitemap_index.xml",
-            f"{base}/sitemap-index.xml",
-            f"{base}/sitemapindex.xml",
+          # common sitemap candidates
+          base = "https://www.papershoot.com"
+          candidates = [
+            "https://www.papershoot.com/sitemap.xml",
+            "https://www.papershoot.com/sitemap_index.xml",
+            "https://www.papershoot.com/sitemap-index.xml",
+            "https://www.papershoot.com/sitemapindex.xml",
           ]
 
-          seen: set[str] = set()
-          sitemap_urls: list[str] = []
-          for sm in sitemap_candidates:
-            expand_sitemap(sm, seen, sitemap_urls, base)
+          # ensure marketing landing page always covered
+          targets.add("https://www.papershoot.com/products/paper-shoot-camera")
 
-          expanded.extend(sitemap_urls)
+          # avoid duplicates
+          seen_cands = set()
+          for u in candidates:
+            seen_cands.add(u)
+            content = fetch(u)
+            if content is not None:
+              parse_sitemap(content, u, targets, max_depth=2)
 
-          # Add key landing page (marketing)
-          expanded.append('https://www.papershoot.com/products/paper-shoot-camera')
+          for sm in sitemaps:
+            if sm in seen_cands:
+              continue
+            seen_cands.add(sm)
+            content = fetch(sm)
+            if content is None:
+              continue
+            parse_sitemap(content, sm, targets, max_depth=3)
 
-          # Deduplicate while preserving order
-          deduped: list[str] = []
-          seen_target: set[str] = set()
-          for u in expanded:
-            if u not in seen_target:
-              deduped.append(u)
-              seen_target.add(u)
+          # dedupe + stable ordering
+          with open("expanded_urls.txt", "w", encoding="utf-8") as f:
+            for u in sorted(targets):
+              f.write(u + "\n")
 
-          Path('expanded_urls.txt').write_text('\n'.join(deduped), encoding='utf-8')
+          print(f"Expanded {len(targets)} URLs into expanded_urls.txt")
           PY
 
       - name: Run lychee
@@ -138,38 +141,75 @@ jobs:
         uses: lycheeverse/lychee-action@v2
         continue-on-error: true
         with:
-          args: --config lychee.toml --cache --format json --output report.json --files-from expanded_urls.txt
+          args: --config lychee.toml --cache --files-from expanded_urls.txt --format json --output report.json
 
       - name: Build report.md
+        id: build_report
         run: |
           python - <<'PY'
           import json
-          import pathlib
+          import os
+          from pathlib import Path
 
-          path = pathlib.Path('report.json')
-          md = ['Link check report\n']
-          if not path.exists():
-            md.append('report.json was not generated.\n')
+          report_json = Path("report.json")
+          report_md = Path("report.md")
+
+          failures_count = 0
+          raw = ""
+
+          if report_json.exists():
+            raw = report_json.read_text(encoding="utf-8", errors="replace")
+
+          def write_env():
+            env_file = Path(os.environ["GITHUB_ENV"])
+            env_file.write_text(env_file.read_text() + f"FAILURES_COUNT={failures_count}\n")
+
+          report_lines = ["## Lychee Report"]
+
+          if not raw:
+            report_lines.append("report.json not generated")
           else:
-            raw = path.read_text(encoding='utf-8')
             try:
               data = json.loads(raw)
-              failures = data.get('failures', [])
-              if not failures:
-                md.append('No broken links detected.\n')
+              failures = data.get("failures")
+
+              if isinstance(failures, list):
+                failures_count = len(failures)
+                report_lines.append(f"failures: {failures_count}")
+                report_lines.append("")
+
+                # try to render a simple table
+                report_lines.append("| status | URL |")
+                report_lines.append("|---|---|")
+                for f in failures:
+                  status = f.get("status") if isinstance(f, dict) else ""
+                  url = f.get("target") if isinstance(f, dict) else ""
+                  report_lines.append(f"| {status} | {url} |")
               else:
-                md.append(f"Broken links detected: {len(failures)}\n\n")
-                for i, fail in enumerate(failures, 1):
-                  target = fail.get('target', '')
-                  status = fail.get('status', '')
-                  md.append(f"{i}. {target} (status: {status})\n")
+                report_lines.append("Could not locate 'failures' list in JSON.")
+                report_lines.append("\n```json")
+                report_lines.append(raw)
+                report_lines.append("```")
             except Exception:
-              md.append('report.json is not valid JSON; raw content follows:\n\n')
-              md.append(raw)
-          pathlib.Path('report.md').write_text(''.join(md), encoding='utf-8')
+              failures_count = -1
+              report_lines.append("report.json is not valid JSON")
+              report_lines.append("\n```json")
+              report_lines.append(raw)
+              report_lines.append("```")
+
+          report_md.write_text("\n".join(report_lines), encoding="utf-8")
+          write_env()
           PY
 
+      - name: Save lychee cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .lycheecache
+          key: ${{ steps.restore_cache.outputs.cache-primary-key }}
+
       - name: Upload reports (artifact)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: link-check-reports
@@ -179,25 +219,24 @@ jobs:
             report.md
           if-no-files-found: warn
 
-      - name: Post Slack notification (lychee failed)
-        if: steps.lychee.outcome == 'failure'
+      - name: Post Slack notification (failures > 0)
+        if: env.FAILURES_COUNT != '' && env.FAILURES_COUNT != '0'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            exit 0
-          fi
-
-          STATUS="✅ No broken links"
-          STATUS="❌ Broken links detected"
-          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          cat <<EOF >/tmp/slack.json
-          {"text":"Link check status: $STATUS\nRun URL: $RUN_URL"}
+          echo "Posting Slack notification..."
+          escaped=$(printf '%s' "$RUN_URL" | python -c 'import json,sys;print(json.dumps(sys.stdin.read()))')
+          payload=$(cat <<EOF
+          {
+            "text": "\ud83d\udd0e Link check detected issues (failures > 0)\nRun: $RUN_URL"
+          }
           EOF
-          curl -X POST -H 'Content-type: application/json' --data @/tmp/slack.json "$SLACK_WEBHOOK_URL"
+          )
+          curl -s -X POST -H 'Content-type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL" >/dev/null
 
-      - name: Create issue if failed
-        if: steps.lychee.outcome == 'failure'
+      - name: Create issue if failures > 0
+        if: env.FAILURES_COUNT != '' && env.FAILURES_COUNT != '0'
         uses: peter-evans/create-issue-from-file@v5
         with:
           title: "Broken links detected (lychee)"
@@ -208,6 +247,6 @@ jobs:
           assignees: |
             Georgelin0525
 
-      - name: Fail job if lychee found issues
-        if: steps.lychee.outcome == 'failure'
+      - name: Fail job if failures > 0
+        if: env.FAILURES_COUNT != '' && env.FAILURES_COUNT != '0'
         run: exit 1
