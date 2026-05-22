@@ -1,4 +1,5 @@
 name: Weekly link check (lychee)
+
 on:
   schedule:
     # 每週一 00:00 UTC = 台北 08:00
@@ -37,36 +38,38 @@ jobs:
           from pathlib import Path
 
           urlset = {"https://linktr.ee/papershootcam"}
+
           urls_file = Path("urls.txt")
           if urls_file.exists():
             for line in urls_file.read_text(encoding="utf-8").splitlines():
               line = line.strip()
-              if line:
-                urlset.add(line)
+              if not line:
+                continue
+              urlset.add(line)
 
-          sitemap_url = "https://www.papershoot.com/sitemap.xml"
-
+          # Best-effort: fetch sitemap to expand scope
           try:
             ctx = ssl.create_default_context()
-            with urllib.request.urlopen(sitemap_url, context=ctx, timeout=20) as resp:
+            with urllib.request.urlopen("https://www.papershoot.com/sitemap.xml", context=ctx, timeout=20) as resp:
               data = resp.read()
+
             root = ET.fromstring(data)
-            for loc in root.findall('.//{http://www.sitemaps.org/schemas/sitemap/0.9}loc'):
+            ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+            for loc in root.findall(".//sm:loc", ns):
               if loc.text:
                 urlset.add(loc.text.strip())
           except Exception as e:
             print(f"Skipped sitemap fetch: {e}")
 
-          out = Path("expanded_urls.txt")
-          out.write_text("\n".join(sorted(urlset)), encoding="utf-8")
-          print(f"Wrote {len(urlset)} URLs to {out}")
+          Path("expanded_urls.txt").write_text("\n".join(sorted(urlset)), encoding="utf-8")
+          print(f"Wrote expanded_urls.txt with {len(urlset)} urls")
           PY
 
       - name: Run lychee
         id: lychee
         uses: lycheeverse/lychee-action@v2
         with:
-          args: |
+          args: >
             --config lychee.toml
             --cache
             --max-cache-age 7d
@@ -78,18 +81,19 @@ jobs:
         if: always()
         run: |
           python - <<'PY'
-          from pathlib import Path
+          import json, pathlib, datetime
 
-          md = ["## Lychee report"]
-          json_path = Path("report.json")
-          if json_path.exists():
-            md.append("```json")
-            md.append(json_path.read_text(encoding="utf-8").strip())
-            md.append("```")
+          p = pathlib.Path("report.json")
+          md = pathlib.Path("report.md")
+          timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+          if p.exists():
+            data = p.read_text(encoding="utf-8")
+            md.write_text(f"# Link check report\n\nTime: {timestamp}\n\n```json\n{data}\n```\n", encoding="utf-8")
           else:
-            md.append("_No report.json produced; see workflow logs._")
+            md.write_text(f"# Link check report\n\nTime: {timestamp}\n\nreport.json is missing.\n", encoding="utf-8")
 
-          Path("report.md").write_text("\n".join(md), encoding="utf-8")
+          print("Wrote report.md")
           PY
 
       - name: Save lychee cache
@@ -105,10 +109,22 @@ jobs:
         with:
           name: link-check-reports
           path: |
-            expanded_urls.txt
             report.json
             report.md
+            expanded_urls.txt
           if-no-files-found: warn
+
+      - name: Post Slack notification
+        if: steps.lychee.outcome == 'failure' && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          payload=$(cat <<JSON
+          {"text":":rotating_light: Link check failed for *${{ github.repository }}* <${RUN_URL}|Run #${{ github.run_id }}> on `${{ github.ref }}`"}
+          JSON
+          )
+          curl -X POST -H 'Content-type: application/json' --data "$payload" "$WEBHOOK_URL"
 
       - name: Fail if lychee found issues
         if: steps.lychee.outcome == 'failure'
@@ -123,4 +139,5 @@ jobs:
           labels: |
             link-check
             priority:medium
-          assignees: Georgelin0525
+          assignees: |
+            Georgelin0525
