@@ -26,7 +26,8 @@ jobs:
         with:
           path: .lycheecache
           key: cache-lychee-${{ github.run_id }}
-          restore-keys: cache-lychee-
+          restore-keys: |
+            cache-lychee-
 
       - name: Expand sitemap URLs
         run: |
@@ -37,62 +38,77 @@ jobs:
           import ssl
 
           urls = []
-          with open("urls.txt", "r", encoding="utf-8") as f:
+          with open('urls.txt', 'r') as f:
               for line in f:
                   line = line.strip()
                   if line:
                       urls.append(line)
 
-          # Explicitly include Linktree entry
-          urls.append("https://linktr.ee/papershootcam")
+          linktree = 'https://linktr.ee/papershootcam'
+          if linktree not in urls:
+              urls.append(linktree)
 
-          # Try papershoot sitemap
+          sitemap_url = 'https://www.papershoot.com/sitemap.xml'
           try:
-              ssl_context = ssl.create_default_context()
-              with urllib.request.urlopen("https://www.papershoot.com/sitemap.xml", context=ssl_context, timeout=30) as resp:
-                  data = resp.read()
+              ctx = ssl.create_default_context()
+              with urllib.request.urlopen(sitemap_url, context=ctx, timeout=30) as response:
+                  xml_content = response.read()
 
-              root = ET.fromstring(data)
-              ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-              for loc in root.findall(".//sm:loc", ns):
-                  u = loc.text.strip()
-                  if u not in urls:
-                      urls.append(u)
+              root = ET.fromstring(xml_content)
+              ns = {'sm': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
 
-              print(f"Added {len(urls)} URLs (including sitemap)")
+              if root.tag.endswith('sitemapindex'):
+                  for sitemap in root.findall('sm:sitemap', ns):
+                      loc = sitemap.find('sm:loc', ns)
+                      if loc is not None and loc.text:
+                          urls.append(loc.text.strip())
+              else:
+                  for url_tag in root.findall('sm:url', ns):
+                      loc = url_tag.find('sm:loc', ns)
+                      if loc is not None and loc.text:
+                          urls.append(loc.text.strip())
           except Exception as e:
-              print(f"Skipped sitemap fetch: {e}")
+              print(f"Skipped sitemap fetch due to: {e}", flush=True)
 
-          with open("expanded_urls.txt", "w", encoding="utf-8") as f:
-              f.write("\n".join(urls))
+          with open('expanded_urls.txt', 'w') as out:
+              out.write('\n'.join(urls))
+              out.write('\n')
           PY
 
       - name: Run lychee
         id: lychee
-        uses: lycheeverse/lychee-action@v2
         continue-on-error: true
+        uses: lycheeverse/lychee-action@v2
         with:
           args: >
             --config lychee.toml
             --cache
             --max-cache-age 7d
-            --format json --output report.json
             @expanded_urls.txt
+          output: report.json
 
       - name: Build report.md
         if: always()
         run: |
           set -euo pipefail
-          if [ -f report.json ]; then
-            echo "## Lychee report" > report.md
-            echo "" >> report.md
-            echo '```json' >> report.md
-            cat report.json >> report.md
-            echo '```' >> report.md
-          else
-            echo "## Lychee report" > report.md
-            echo "report.json was not generated." >> report.md
-          fi
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report_path = Path('report.json')
+          md_path = Path('report.md')
+
+          if report_path.exists():
+              data = report_path.read_text()
+              try:
+                  json.loads(data)
+              except json.JSONDecodeError:
+                  md_path.write_text("Lychee report\nreport.json was generated but is not valid JSON.\n")
+              else:
+                  md_path.write_text("Lychee report\n```json\n" + data + "\n```\n")
+          else:
+              md_path.write_text("Lychee report\nreport.json was not generated.\n")
+          PY
 
       - name: Save lychee cache
         if: always()
@@ -116,14 +132,29 @@ jobs:
         if: steps.lychee.outcome == 'failure'
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          set -euo pipefail
+
           if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
-            echo "No Slack webhook configured; skipping."
+            echo "No SLACK_WEBHOOK_URL configured; skipping Slack notification."
             exit 0
           fi
 
-          curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"Lychee link check failed in repo *${GITHUB_REPOSITORY}*. Run: ${RUN_URL}\"}" "$SLACK_WEBHOOK_URL"
+          RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          BRANCH="${GITHUB_REF##refs/heads/}"
+          short_sha="${GITHUB_SHA::7}"
+
+          payload=$(cat <<EOF
+          {
+            "text": "Lychee link-check failed in \`${GITHUB_REPOSITORY}\`\nBranch: \`${BRANCH}\` (commit: \`${short_sha}\`)\nRun: ${RUN_URL}"
+          }
+          EOF
+          )
+
+          curl -sSL -X POST \
+            -H 'Content-type: application/json' \
+            --data "$payload" \
+            "$SLACK_WEBHOOK_URL"
 
       - name: Fail if lychee found issues
         if: steps.lychee.outcome == 'failure'
@@ -138,5 +169,4 @@ jobs:
           labels: |
             link-check
             priority:medium
-          assignees: |
-            Georgelin0525
+          assignees: Georgelin0525
