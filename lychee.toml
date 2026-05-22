@@ -1,10 +1,6 @@
 # Lychee configuration
-
 # Increase or decrease as needed (milliseconds)
 timeout = 20000
-
-# Cache directory
-cache-dir = ".lycheecache"
 
 # Exclude common third-party domains that often block bots.
 exclude = [
