@@ -1,0 +1,2 @@
+# Extra URLs included in lychee checks
+https://www.papershoot.com/products/paper-shoot-camera
