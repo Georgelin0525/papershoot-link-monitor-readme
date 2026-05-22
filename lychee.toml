@@ -1,5 +1,4 @@
 # Lychee configuration
-accept = ["text/html", "text/plain", "application/json", "application/xml"]
 
 # Increase or decrease as needed (milliseconds)
 timeout = 20000
@@ -15,6 +14,3 @@ exclude = [
   "youtube.com",
   "pinterest.com"
 ]
-
-# Optional: add custom headers if某些站會拒絕無 UA 的請求
-# headers = ["User-Agent: PaperShoot-LinkCheck/1.0"]
